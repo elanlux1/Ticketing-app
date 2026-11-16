@@ -1,14 +1,20 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowRight,
+  Bell,
   CheckCircle2,
   Clock,
   Cpu,
+  Lock,
   MessageSquare,
   Plus,
   Search,
   Send,
+  Timer,
   Trash2,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import {
@@ -20,6 +26,20 @@ import {
   TicketStatus,
 } from '../types/tickets';
 import { PydanticTracePanel } from './PydanticTracePanel';
+import {
+  playBellNotification,
+  unlockNotificationAudio,
+} from '../utils/notificationSound';
+
+interface CustomerNotification {
+  id: string;
+  ticketId: string;
+  title: string;
+  message: string;
+  status: TicketStatus;
+  createdAt: string;
+  unread: boolean;
+}
 
 interface TicketingWorkspaceProps {
   openCreateSignal: number;
@@ -36,6 +56,7 @@ const STATUS_LABELS: Record<TicketStatus, string> = {
   open: 'Open',
   in_progress: 'In Progress',
   resolved: 'Resolved',
+  closed: 'Closed',
 };
 
 const PRIORITY_LABELS: Record<TicketPriority, string> = {
@@ -60,6 +81,51 @@ function formatShortTime(iso: string): string {
     });
   } catch {
     return '—';
+  }
+}
+
+function formatCountdown(
+  deadlineIso: string,
+  nowMs: number
+): { label: string; remainingSeconds: number; remainingMs: number; expired: boolean } {
+  const diffMs = Date.parse(deadlineIso) - nowMs;
+  if (Number.isNaN(diffMs) || diffMs <= 0) {
+    return { label: '00:00', remainingSeconds: 0, remainingMs: 0, expired: true };
+  }
+  const totalSec = Math.ceil(diffMs / 1000);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return {
+    label: `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`,
+    remainingSeconds: totalSec,
+    remainingMs: diffMs,
+    expired: false,
+  };
+}
+
+const SEEN_GREETINGS_STORAGE_KEY = 'schemaflow_seen_greetings_v1';
+
+function loadSeenGreetings(): Set<string> {
+  if (typeof window === 'undefined') return new Set();
+  try {
+    const raw = window.sessionStorage.getItem(SEEN_GREETINGS_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? new Set(parsed.map(String)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function persistSeenGreetings(seen: Set<string>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(
+      SEEN_GREETINGS_STORAGE_KEY,
+      JSON.stringify(Array.from(seen).slice(-100))
+    );
+  } catch {
+    // Ignore storage quota issues
   }
 }
 
@@ -90,9 +156,15 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
   const [formPriority, setFormPriority] = useState<TicketPriority>('medium');
   const [formCategory, setFormCategory] = useState<TicketCategory>('bug');
   const [formDescription, setFormDescription] = useState<string>('');
+  const [formParentTicketId, setFormParentTicketId] = useState<string | null>(null);
   const [omitOptionalDefaults, setOmitOptionalDefaults] = useState<boolean>(false);
   const [formErrors, setFormErrors] = useState<ValidationErrorDetail[]>([]);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [isExpiringId, setIsExpiringId] = useState<string | null>(null);
+
+  // Live 1s countdown clock for 5-minute auto-close deadlines
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const expiredSyncDoneRef = useRef<Set<string>>(new Set());
 
   // Comment & reply state
   const [replyRole, setReplyRole] = useState<CommentRole>('customer');
@@ -100,6 +172,111 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
   const [commentBody, setCommentBody] = useState<string>('');
   const [commentError, setCommentError] = useState<string | null>(null);
   const [isPostingComment, setIsPostingComment] = useState<boolean>(false);
+
+  // Customer LLM update notifications + bell chime
+  const [notifications, setNotifications] = useState<CustomerNotification[]>([]);
+  const [isNotifOpen, setIsNotifOpen] = useState<boolean>(false);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [bellAnimating, setBellAnimating] = useState<boolean>(false);
+  const [isGreetingOpenQueue, setIsGreetingOpenQueue] = useState<boolean>(false);
+  const notifContainerRef = useRef<HTMLDivElement | null>(null);
+  const seenGreetingsRef = useRef<Set<string>>(loadSeenGreetings());
+
+  const unreadCount = useMemo(
+    () => notifications.filter((n) => n.unread).length,
+    [notifications]
+  );
+
+  const markGreetingSeen = useCallback((ticket: TicketRecord, triagedAt?: string | null) => {
+    const ts = triagedAt ?? ticket.ai_triage?.triaged_at;
+    if (!ts) return;
+    const key = `${ticket.id}:${ts}`;
+    if (!seenGreetingsRef.current.has(key)) {
+      seenGreetingsRef.current.add(key);
+      persistSeenGreetings(seenGreetingsRef.current);
+    }
+  }, []);
+
+  const notifyCustomerLlmUpdate = useCallback(
+    (
+      ticket: TicketRecord,
+      message: string,
+      opts?: { playSound?: boolean; triagedAt?: string | null }
+    ) => {
+      markGreetingSeen(ticket, opts?.triagedAt);
+      const entry: CustomerNotification = {
+        id: `notif-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        ticketId: ticket.id,
+        title: `${ticket.id} · ${ticket.title}`,
+        message,
+        status: ticket.status,
+        createdAt: new Date().toISOString(),
+        unread: true,
+      };
+      setNotifications((prev) => [entry, ...prev].slice(0, 12));
+      setBellAnimating(true);
+      window.setTimeout(() => setBellAnimating(false), 650);
+      if (opts?.playSound !== false && soundEnabled) {
+        playBellNotification();
+      }
+    },
+    [markGreetingSeen, soundEnabled]
+  );
+
+  const announceUnseenGreetings = useCallback(
+    (tickets: TicketRecord[]) => {
+      const unseen = tickets.filter((t) => {
+        const ts = t.ai_triage?.triaged_at;
+        const reply = t.ai_triage?.suggested_reply;
+        if (!ts || !reply) return false;
+        return !seenGreetingsRef.current.has(`${t.id}:${ts}`);
+      });
+
+      if (unseen.length === 0) return;
+
+      const entries: CustomerNotification[] = unseen.map((t, idx) => {
+        markGreetingSeen(t, t.ai_triage?.triaged_at);
+        return {
+          id: `notif-load-${Date.now()}-${idx}-${t.id}`,
+          ticketId: t.id,
+          title: `${t.id} · ${t.title}`,
+          message: t.ai_triage!.suggested_reply,
+          status: t.status,
+          createdAt: t.ai_triage!.triaged_at,
+          unread: true,
+        };
+      });
+
+      setNotifications((prev) => [...entries, ...prev].slice(0, 12));
+      setBellAnimating(true);
+      window.setTimeout(() => setBellAnimating(false), 650);
+      if (soundEnabled) {
+        playBellNotification();
+      }
+    },
+    [markGreetingSeen, soundEnabled]
+  );
+
+  useEffect(() => {
+    if (!isNotifOpen) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        notifContainerRef.current &&
+        !notifContainerRef.current.contains(event.target as Node)
+      ) {
+        setIsNotifOpen(false);
+      }
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsNotifOpen(false);
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    window.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      window.removeEventListener('keydown', handleKey);
+    };
+  }, [isNotifOpen]);
 
   const fetchTickets = useCallback(
     async (opts?: { recordTrace?: boolean }) => {
@@ -124,12 +301,16 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
         const items: TicketRecord[] = Array.isArray(payload) ? payload : payload.tickets ?? [];
 
         setFilteredTickets(items);
+        let fullList = items;
         if (allRes && allRes.ok) {
           const allPayload = await allRes.json();
-          setAllTickets(Array.isArray(allPayload) ? allPayload : allPayload.tickets ?? []);
+          fullList = Array.isArray(allPayload) ? allPayload : allPayload.tickets ?? [];
+          setAllTickets(fullList);
         } else {
           setAllTickets(items);
         }
+
+        announceUnseenGreetings(fullList);
 
         setSelectedId((prev) => {
           if (prev && items.some((t) => t.id === prev)) return prev;
@@ -145,7 +326,7 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
         setIsLoading(false);
       }
     },
-    [statusFilter, priorityFilter, searchQuery]
+    [statusFilter, priorityFilter, searchQuery, announceUnseenGreetings]
   );
 
   useEffect(() => {
@@ -154,10 +335,53 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
 
   useEffect(() => {
     if (openCreateSignal > 0) {
+      setFormParentTicketId(null);
+      setFormTitle('');
+      setFormEmail('');
+      setFormDescription('');
+      setFormPriority('medium');
+      setFormCategory('bug');
       setFormErrors([]);
       setIsModalOpen(true);
     }
   }, [openCreateSignal]);
+
+  const hasActiveDeadlines = useMemo(
+    () =>
+      allTickets.some(
+        (t) => t.status !== 'resolved' && t.status !== 'closed' && Boolean(t.reply_deadline_at)
+      ),
+    [allTickets]
+  );
+
+  useEffect(() => {
+    if (!hasActiveDeadlines) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveDeadlines]);
+
+  useEffect(() => {
+    const expiredIds = allTickets
+      .filter(
+        (t) =>
+          t.status !== 'resolved' &&
+          t.status !== 'closed' &&
+          t.reply_deadline_at &&
+          Date.parse(t.reply_deadline_at) <= nowMs &&
+          !expiredSyncDoneRef.current.has(`${t.id}:${t.reply_deadline_at}`)
+      )
+      .map((t) => `${t.id}:${t.reply_deadline_at}`);
+
+    if (expiredIds.length > 0) {
+      expiredIds.forEach((key) => expiredSyncDoneRef.current.add(key));
+      window.setTimeout(() => {
+        fetchTickets({ recordTrace: false });
+      }, 150);
+    }
+  }, [allTickets, nowMs, fetchTickets]);
 
   useEffect(() => {
     if (!isModalOpen) return;
@@ -193,11 +417,28 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
       open: allTickets.filter((t) => t.status === 'open').length,
       inProgress: allTickets.filter((t) => t.status === 'in_progress').length,
       resolved: allTickets.filter((t) => t.status === 'resolved').length,
+      closed: allTickets.filter((t) => t.status === 'closed').length,
     };
   }, [allTickets]);
 
+  const openCreateFromClosedTicket = (closedTicket: TicketRecord) => {
+    const baseTitle = closedTicket.title.startsWith('Follow-up:')
+      ? closedTicket.title
+      : `Follow-up: ${closedTicket.title}`;
+    setFormParentTicketId(closedTicket.id);
+    setFormTitle(baseTitle.slice(0, 120));
+    setFormEmail(closedTicket.requester_email);
+    setFormPriority(closedTicket.priority);
+    setFormCategory(closedTicket.category);
+    setFormDescription('');
+    setOmitOptionalDefaults(false);
+    setFormErrors([]);
+    setIsModalOpen(true);
+  };
+
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    unlockNotificationAudio();
     setIsSubmitting(true);
     setFormErrors([]);
 
@@ -210,6 +451,9 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
     if (!omitOptionalDefaults) {
       payload.priority = formPriority;
       payload.category = formCategory;
+    }
+    if (formParentTicketId) {
+      payload.parent_ticket_id = formParentTicketId;
     }
 
     try {
@@ -237,14 +481,39 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
       }
 
       const created = (data.ticket ?? data) as TicketRecord;
-      setAllTickets((prev) => [created, ...prev]);
-      setFilteredTickets((prev) => [created, ...prev]);
+      setAllTickets((prev) => [
+        created,
+        ...prev.map((t) =>
+          formParentTicketId && t.id === formParentTicketId
+            ? { ...t, superseded_by_ticket_id: created.id }
+            : t
+        ),
+      ]);
+      setFilteredTickets((prev) => [
+        created,
+        ...prev.map((t) =>
+          formParentTicketId && t.id === formParentTicketId
+            ? { ...t, superseded_by_ticket_id: created.id }
+            : t
+        ),
+      ]);
       setSelectedId(created.id);
+
+      const autoReplyMsg =
+        data.triage?.suggested_reply ?? created.comments?.[0]?.body ?? null;
+      if (data.auto_replied && autoReplyMsg) {
+        notifyCustomerLlmUpdate(created, autoReplyMsg, {
+          playSound: true,
+          triagedAt: data.triage?.triaged_at ?? created.ai_triage?.triaged_at,
+        });
+      }
+
       setFormTitle('');
       setFormEmail('');
       setFormDescription('');
       setFormPriority('medium');
       setFormCategory('bug');
+      setFormParentTicketId(null);
       setIsModalOpen(false);
     } catch {
       setFormErrors([{ loc: ['network'], msg: 'Network error submitting ticket', type: 'network' }]);
@@ -253,7 +522,31 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
     }
   };
 
+  const handleExpireTicket = async (ticketId: string, delaySeconds = 0) => {
+    setIsExpiringId(ticketId);
+    try {
+      const res = await fetch(`/api/tickets/${ticketId}/expire`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(delaySeconds > 0 ? { delay_seconds: delaySeconds } : {}),
+      });
+      const data = await res.json();
+      if (data.trace) {
+        setLastTrace(data.trace);
+      }
+      if (res.ok && data.ticket) {
+        const updated = data.ticket as TicketRecord;
+        setAllTickets((prev) => prev.map((t) => (t.id === ticketId ? updated : t)));
+        setFilteredTickets((prev) => prev.map((t) => (t.id === ticketId ? updated : t)));
+        setNowMs(Date.now());
+      }
+    } finally {
+      setIsExpiringId(null);
+    }
+  };
+
   const handleRunGeminiTriage = async (ticketId: string) => {
+    unlockNotificationAudio();
     setIsTriaging(true);
     setTriageError(null);
 
@@ -281,10 +574,45 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
       const updated = data.ticket as TicketRecord;
       setAllTickets((prev) => prev.map((t) => (t.id === ticketId ? updated : t)));
       setFilteredTickets((prev) => prev.map((t) => (t.id === ticketId ? updated : t)));
+      if (updated.ai_triage?.suggested_reply) {
+        notifyCustomerLlmUpdate(updated, updated.ai_triage.suggested_reply, {
+          playSound: true,
+          triagedAt: updated.ai_triage.triaged_at,
+        });
+      }
     } catch {
       setTriageError('Network error running Gemini triage.');
     } finally {
       setIsTriaging(false);
+    }
+  };
+
+  const handleGreetOpenQueue = async () => {
+    unlockNotificationAudio();
+    setIsGreetingOpenQueue(true);
+    try {
+      const res = await fetch('/api/tickets/greet-open', { method: 'POST' });
+      const data = await res.json();
+      if (data.trace) {
+        setLastTrace(data.trace);
+      }
+      if (res.ok) {
+        const greetedList: TicketRecord[] = Array.isArray(data.greeted_tickets)
+          ? data.greeted_tickets
+          : [];
+        greetedList.forEach((t, idx) => {
+          const msg = t.ai_triage?.suggested_reply ?? t.comments?.[t.comments.length - 1]?.body;
+          if (msg) {
+            notifyCustomerLlmUpdate(t, msg, {
+              playSound: idx === 0,
+              triagedAt: t.ai_triage?.triaged_at,
+            });
+          }
+        });
+        await fetchTickets({ recordTrace: false });
+      }
+    } finally {
+      setIsGreetingOpenQueue(false);
     }
   };
 
@@ -325,6 +653,7 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
     body: string,
     role: CommentRole
   ) => {
+    unlockNotificationAudio();
     setIsPostingComment(true);
     setCommentError(null);
 
@@ -346,10 +675,30 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
         return false;
       }
 
+      if (res.status === 409) {
+        setCommentError(
+          typeof data.detail === 'string'
+            ? data.detail
+            : 'Ticket was auto-closed. Please create a new ticket.'
+        );
+        if (data.ticket) {
+          const closed = data.ticket as TicketRecord;
+          setAllTickets((prev) => prev.map((t) => (t.id === closed.id ? closed : t)));
+          setFilteredTickets((prev) => prev.map((t) => (t.id === closed.id ? closed : t)));
+        }
+        return false;
+      }
+
       if (res.ok) {
         const updated = (data.ticket ?? data) as TicketRecord;
         setAllTickets((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
         setFilteredTickets((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+        if (data.auto_replied && data.triage?.suggested_reply) {
+          notifyCustomerLlmUpdate(updated, data.triage.suggested_reply, {
+            playSound: true,
+            triagedAt: data.triage.triaged_at,
+          });
+        }
         return true;
       }
       return false;
@@ -433,6 +782,14 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
         </span>
       );
     }
+    if (status === 'closed') {
+      return (
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-rose-800 whitespace-nowrap">
+          <Lock className="w-3.5 h-3.5 text-rose-700" aria-hidden="true" />
+          Closed
+        </span>
+      );
+    }
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-800 whitespace-nowrap">
         <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" aria-hidden="true" />
@@ -465,6 +822,138 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
         </div>
 
         <div className="flex items-center gap-3 shrink-0">
+          {/* Customer LLM Notification Bell */}
+          <div className="relative" ref={notifContainerRef}>
+            <button
+              type="button"
+              onClick={() => {
+                unlockNotificationAudio();
+                setIsNotifOpen((open) => !open);
+              }}
+              aria-label={`Customer notifications (${unreadCount} unread)`}
+              aria-expanded={isNotifOpen}
+              className={`relative inline-flex items-center justify-center w-10 h-10 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg transition-transform cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-600 ${
+                bellAnimating ? 'scale-105 border-sky-600 text-sky-700' : 'text-slate-700'
+              }`}
+            >
+              <Bell className="w-4 h-4" aria-hidden="true" />
+              {unreadCount > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 min-w-5 h-5 px-1 inline-flex items-center justify-center text-[11px] font-mono font-bold text-white bg-sky-700 rounded-md tabular-nums">
+                  {unreadCount}
+                </span>
+              )}
+            </button>
+
+            {isNotifOpen && (
+              <div
+                role="region"
+                aria-label="Customer LLM update notifications"
+                className="absolute right-0 mt-2 w-80 sm:w-96 bg-white border border-slate-200 rounded-xl shadow-lg z-40 overflow-hidden"
+              >
+                <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-900">
+                      Customer LLM Updates
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      Chimes whenever Gemini sends a customer update
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        unlockNotificationAudio();
+                        playBellNotification();
+                      }}
+                      className="px-2 py-1 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      Test Bell
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSoundEnabled((prev) => !prev)}
+                      aria-label={soundEnabled ? 'Mute bell sound' : 'Unmute bell sound'}
+                      className="p-1.5 text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded transition-colors cursor-pointer"
+                    >
+                      {soundEnabled ? (
+                        <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
+                      ) : (
+                        <VolumeX className="w-3.5 h-3.5" aria-hidden="true" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="max-h-72 overflow-y-auto divide-y divide-slate-200">
+                  {notifications.length === 0 ? (
+                    <div className="p-5 text-center text-xs text-slate-500">
+                      No LLM updates yet. Send a customer reply or run Auto-Triage with Gemini to trigger an update and bell chime.
+                    </div>
+                  ) : (
+                    notifications.map((n) => (
+                      <button
+                        key={n.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedId(n.ticketId);
+                          setNotifications((prev) =>
+                            prev.map((item) =>
+                              item.id === n.id ? { ...item, unread: false } : item
+                            )
+                          );
+                          setIsNotifOpen(false);
+                        }}
+                        className={`w-full text-left px-4 py-3 hover:bg-slate-50 transition-colors cursor-pointer ${
+                          n.unread ? 'bg-sky-50/50' : 'bg-white'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 text-xs mb-1">
+                          <span className="font-semibold text-slate-900 truncate">
+                            {n.title}
+                          </span>
+                          <span className="font-mono text-[11px] text-slate-500 shrink-0 tabular-nums">
+                            {formatShortTime(n.createdAt)}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-600 line-clamp-2 leading-relaxed">
+                          {n.message}
+                        </p>
+                        <div className="mt-1.5 flex items-center gap-2 text-[11px] text-slate-500">
+                          <span className="font-medium text-sky-700">
+                            {STATUS_LABELS[n.status]}
+                          </span>
+                          {n.unread && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-semibold text-slate-900">Unread</span>
+                            </>
+                          )}
+                        </div>
+                      </button>
+                    ))
+                  )}
+                </div>
+
+                {notifications.length > 0 && unreadCount > 0 && (
+                  <div className="px-4 py-2.5 border-t border-slate-200 bg-slate-50 flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setNotifications((prev) =>
+                          prev.map((item) => ({ ...item, unread: false }))
+                        )
+                      }
+                      className="text-xs font-semibold text-sky-700 hover:text-sky-800 cursor-pointer"
+                    >
+                      Mark all read
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           <button
             type="button"
             onClick={onViewPythonCode}
@@ -475,6 +964,12 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
           <button
             type="button"
             onClick={() => {
+              setFormParentTicketId(null);
+              setFormTitle('');
+              setFormEmail('');
+              setFormDescription('');
+              setFormPriority('medium');
+              setFormCategory('bug');
               setFormErrors([]);
               setIsModalOpen(true);
             }}
@@ -486,8 +981,8 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
         </div>
       </div>
 
-      {/* 4-Column KPI Strip */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      {/* 5-Column KPI Strip */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
         <div className="bg-white border border-slate-200 rounded-xl p-4">
           <div className="text-xs font-medium text-slate-500">Total Tickets</div>
           <div className="mt-1 font-display text-2xl font-bold text-slate-900 tabular-nums">
@@ -512,12 +1007,18 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
             {counts.resolved}
           </div>
         </div>
+        <div className="bg-white border border-slate-200 rounded-xl p-4 col-span-2 sm:col-span-1">
+          <div className="text-xs font-medium text-slate-500">Auto-Closed</div>
+          <div className="mt-1 font-display text-2xl font-bold text-rose-700 tabular-nums">
+            {counts.closed}
+          </div>
+        </div>
       </div>
 
       {/* Filter Toolbar */}
       <div className="bg-white border border-slate-200 rounded-xl p-3 sm:p-4 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
-          {(['all', 'open', 'in_progress', 'resolved'] as const).map((st) => {
+          {(['all', 'open', 'in_progress', 'resolved', 'closed'] as const).map((st) => {
             const active = statusFilter === st;
             return (
               <button
@@ -537,6 +1038,20 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
         </div>
 
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+          {counts.open > 0 && (
+            <button
+              type="button"
+              disabled={isGreetingOpenQueue}
+              onClick={handleGreetOpenQueue}
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-sky-800 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+            >
+              <Cpu className="w-3.5 h-3.5" aria-hidden="true" />
+              {isGreetingOpenQueue
+                ? 'Greeting Open Queue...'
+                : `Greet Open Queue (${counts.open})`}
+            </button>
+          )}
+
           <div className="relative">
             <Search
               className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
@@ -656,7 +1171,23 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                           {PRIORITY_LABELS[ticket.priority]}
                         </td>
                         <td className="py-3 px-4 whitespace-nowrap">
-                          {getStatusBadge(ticket.status)}
+                          <div className="flex flex-col gap-1">
+                            {getStatusBadge(ticket.status)}
+                            {ticket.status !== 'resolved' &&
+                              ticket.status !== 'closed' &&
+                              ticket.reply_deadline_at &&
+                              (() => {
+                                const cd = formatCountdown(ticket.reply_deadline_at, nowMs);
+                                if (cd.remainingSeconds <= 5) {
+                                  return (
+                                    <span className="inline-flex items-center px-1.5 py-0.5 rounded border border-black bg-white font-mono text-[11px] font-bold text-black tabular-nums w-fit">
+                                      {cd.remainingSeconds}s left
+                                    </span>
+                                  );
+                                }
+                                return null;
+                              })()}
+                          </div>
                         </td>
                         <td className="py-3 px-4 text-right font-mono text-xs text-slate-500 tabular-nums whitespace-nowrap">
                           {formatShortTime(ticket.updated_at)}
@@ -676,10 +1207,22 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
             <div className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5">
               <div className="flex items-start justify-between gap-4 pb-4 border-b border-slate-200">
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2 text-xs text-slate-500 font-mono mb-1">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 font-mono mb-1">
                     <span className="font-semibold text-slate-800">{selectedTicket.id}</span>
                     <span aria-hidden="true">·</span>
                     <span>{CATEGORY_LABELS[selectedTicket.category]}</span>
+                    {selectedTicket.parent_ticket_id && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedId(selectedTicket.parent_ticket_id!)}
+                          className="text-sky-700 hover:underline cursor-pointer"
+                        >
+                          Follow-up to {selectedTicket.parent_ticket_id}
+                        </button>
+                      </>
+                    )}
                   </div>
                   <h2 className="font-display text-lg font-bold text-slate-900 leading-snug">
                     {selectedTicket.title}
@@ -703,6 +1246,80 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                 {selectedTicket.description}
               </p>
 
+              {/* 5-Minute Reply Deadline Bar or Auto-Closed Banner */}
+              {selectedTicket.status === 'closed' ? (
+                <div className="p-4 rounded-lg bg-rose-50 border border-rose-200 space-y-3">
+                  <div className="flex items-start gap-2.5">
+                    <Lock className="w-4 h-4 text-rose-700 shrink-0 mt-0.5" aria-hidden="true" />
+                    <div className="text-xs text-rose-900 space-y-1">
+                      <div className="font-semibold">
+                        Ticket Auto-Closed (5-Minute Reply Window Expired)
+                      </div>
+                      <p className="text-rose-800 leading-relaxed">
+                        {selectedTicket.closed_reason ||
+                          'No customer reply was received within 5 minutes.'}{' '}
+                        Closed tickets cannot be reopened—a new ticket must be created to continue.
+                      </p>
+                    </div>
+                  </div>
+                  {selectedTicket.superseded_by_ticket_id ? (
+                    <button
+                      type="button"
+                      onClick={() => setSelectedId(selectedTicket.superseded_by_ticket_id!)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-sky-800 bg-white border border-sky-200 hover:bg-sky-50 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      View New Ticket ({selectedTicket.superseded_by_ticket_id})
+                      <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => openCreateFromClosedTicket(selectedTicket)}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-sky-700 hover:bg-sky-800 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+                      Create New Ticket
+                    </button>
+                  )}
+                </div>
+              ) : (
+                selectedTicket.status !== 'resolved' &&
+                selectedTicket.reply_deadline_at &&
+                (() => {
+                  const countdown = formatCountdown(selectedTicket.reply_deadline_at, nowMs);
+                  if (countdown.remainingSeconds > 5) {
+                    return null;
+                  }
+                  const pct = Math.max(0, Math.min(100, (countdown.remainingMs / 5000) * 100));
+                  return (
+                    <div
+                      role="timer"
+                      aria-live="polite"
+                      className="p-4 rounded-lg bg-white border-2 border-black space-y-2.5 text-black"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2 text-xs font-semibold text-black">
+                          <Timer className="w-4 h-4 text-black shrink-0" aria-hidden="true" />
+                          <span>Ticket Closing Soon</span>
+                        </div>
+                        <span className="px-2.5 py-1 rounded-md border border-black bg-white font-mono text-lg font-bold text-black tabular-nums">
+                          {countdown.remainingSeconds}s
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full bg-slate-200 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-black transition-[width] duration-700 ease-linear"
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                      <p className="text-xs text-black/80 leading-relaxed">
+                        Auto-closing in {countdown.remainingSeconds}s due to reply delay. Send a customer reply below to keep this ticket open, or a new ticket will be required.
+                      </p>
+                    </div>
+                  );
+                })()
+              )}
+
               {/* Gemini + Pydantic Triage Action Bar */}
               <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -711,19 +1328,35 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                       Gemini + Pydantic Thread Triage
                     </div>
                     <div className="text-xs text-slate-500">
-                      Reads ticket &amp; replies; updates status automatically
+                      Auto-replies when opened; closes after 5-min reply delay
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    disabled={isTriaging}
-                    onClick={() => handleRunGeminiTriage(selectedTicket.id)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-                  >
-                    <Cpu className="w-3.5 h-3.5" aria-hidden="true" />
-                    {isTriaging ? 'Analyzing Thread...' : 'Auto-Triage with Gemini'}
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {selectedTicket.status !== 'resolved' &&
+                      selectedTicket.status !== 'closed' &&
+                      selectedTicket.reply_deadline_at &&
+                      formatCountdown(selectedTicket.reply_deadline_at, nowMs).remainingSeconds > 5 && (
+                        <button
+                          type="button"
+                          disabled={isExpiringId === selectedTicket.id}
+                          onClick={() => handleExpireTicket(selectedTicket.id, 5)}
+                          className="px-2.5 py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                        >
+                          {isExpiringId === selectedTicket.id ? 'Starting...' : 'Test 5s Close'}
+                        </button>
+                      )}
+
+                    <button
+                      type="button"
+                      disabled={isTriaging || selectedTicket.status === 'closed'}
+                      onClick={() => handleRunGeminiTriage(selectedTicket.id)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                    >
+                      <Cpu className="w-3.5 h-3.5" aria-hidden="true" />
+                      {isTriaging ? 'Analyzing Thread...' : 'Auto-Triage with Gemini'}
+                    </button>
+                  </div>
                 </div>
 
                 {triageError && (
@@ -751,24 +1384,26 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                     </p>
                     <div className="p-2.5 rounded-md bg-white border border-slate-200 space-y-2">
                       <p className="text-slate-700 leading-relaxed">
-                        <span className="font-semibold text-slate-900">Suggested Reply:</span>{' '}
+                        <span className="font-semibold text-slate-900">Latest AI Reply:</span>{' '}
                         {selectedTicket.ai_triage.suggested_reply}
                       </p>
-                      <button
-                        type="button"
-                        disabled={isPostingComment}
-                        onClick={() =>
-                          postCommentText(
-                            selectedTicket.id,
-                            'Gemini Support',
-                            selectedTicket.ai_triage!.suggested_reply,
-                            'agent'
-                          )
-                        }
-                        className="px-2.5 py-1 text-xs font-semibold text-sky-700 hover:text-sky-800 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded transition-colors whitespace-nowrap cursor-pointer"
-                      >
-                        Post Reply to Thread
-                      </button>
+                      {selectedTicket.status !== 'closed' && (
+                        <button
+                          type="button"
+                          disabled={isPostingComment}
+                          onClick={() =>
+                            postCommentText(
+                              selectedTicket.id,
+                              'Gemini Support',
+                              selectedTicket.ai_triage!.suggested_reply,
+                              'agent'
+                            )
+                          }
+                          className="px-2.5 py-1 text-xs font-semibold text-sky-700 hover:text-sky-800 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded transition-colors whitespace-nowrap cursor-pointer"
+                        >
+                          Post Reply to Thread
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}
@@ -780,13 +1415,14 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                   <label className="block text-xs font-medium text-slate-500 mb-1.5">
                     Status (TicketUpdate)
                   </label>
-                  <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-                    {(['open', 'in_progress', 'resolved'] as TicketStatus[]).map((st) => (
+                  <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                    {(['open', 'in_progress', 'resolved', 'closed'] as TicketStatus[]).map((st) => (
                       <button
                         key={st}
                         type="button"
+                        disabled={selectedTicket.status === 'closed' && st !== 'closed'}
                         onClick={() => handleUpdateTicket(selectedTicket.id, { status: st })}
-                        className={`flex-1 px-2 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                        className={`flex-1 px-2 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                           selectedTicket.status === st
                             ? 'bg-white text-slate-900 shadow-sm'
                             : 'text-slate-600 hover:text-slate-900'
@@ -879,79 +1515,94 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                   </div>
                 )}
 
-                <form onSubmit={handleAddComment} className="space-y-2.5 pt-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-                      <button
-                        type="button"
-                        onClick={() => setReplyRole('customer')}
-                        className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
-                          replyRole === 'customer'
-                            ? 'bg-white text-slate-900 shadow-sm'
-                            : 'text-slate-600 hover:text-slate-900'
-                        }`}
-                      >
-                        Customer Reply
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setReplyRole('agent')}
-                        className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
-                          replyRole === 'agent'
-                            ? 'bg-white text-slate-900 shadow-sm'
-                            : 'text-slate-600 hover:text-slate-900'
-                        }`}
-                      >
-                        Agent Note
-                      </button>
-                    </div>
-
-                    <span className="text-xs text-slate-500">
-                      {replyRole === 'customer'
-                        ? 'Auto-triggers Gemini response'
-                        : 'Moves Open -> In Progress'}
+                {selectedTicket.status === 'closed' ? (
+                  <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600">
+                    <span>
+                      Replies are disabled because this ticket auto-closed after 5 minutes.
                     </span>
-                  </div>
-
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={commentAuthor}
-                      onChange={(e) => setCommentAuthor(e.target.value)}
-                      placeholder={replyRole === 'customer' ? 'Customer email' : 'Agent name'}
-                      aria-label="Reply author"
-                      className="w-36 px-2.5 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-600"
-                    />
-                    <input
-                      type="text"
-                      value={commentBody}
-                      onChange={(e) => setCommentBody(e.target.value)}
-                      placeholder={
-                        replyRole === 'customer'
-                          ? 'Simulate customer reply...'
-                          : 'Add an internal or support note...'
-                      }
-                      aria-label="Comment body"
-                      className="flex-1 px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-600"
-                    />
                     <button
-                      type="submit"
-                      disabled={isPostingComment}
-                      aria-label="Send message"
-                      className="inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors shrink-0 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                      type="button"
+                      onClick={() => openCreateFromClosedTicket(selectedTicket)}
+                      className="px-3 py-1.5 font-semibold text-white bg-sky-700 hover:bg-sky-800 rounded-md transition-colors whitespace-nowrap cursor-pointer"
                     >
-                      <Send className="w-3.5 h-3.5" aria-hidden="true" />
-                      {isPostingComment
-                        ? 'Sending...'
-                        : replyRole === 'customer'
-                        ? 'Send Reply'
-                        : 'Post Note'}
+                      Open New Ticket
                     </button>
                   </div>
-                  {commentError && (
-                    <p className="text-xs text-rose-700 font-medium">{commentError}</p>
-                  )}
-                </form>
+                ) : (
+                  <form onSubmit={handleAddComment} className="space-y-2.5 pt-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                        <button
+                          type="button"
+                          onClick={() => setReplyRole('customer')}
+                          className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                            replyRole === 'customer'
+                              ? 'bg-white text-slate-900 shadow-sm'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Customer Reply
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setReplyRole('agent')}
+                          className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                            replyRole === 'agent'
+                              ? 'bg-white text-slate-900 shadow-sm'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Agent Note
+                        </button>
+                      </div>
+
+                      <span className="text-xs text-slate-500">
+                        {replyRole === 'customer'
+                          ? 'Auto-triggers Gemini response'
+                          : 'Starts 5-min customer reply window'}
+                      </span>
+                    </div>
+
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={commentAuthor}
+                        onChange={(e) => setCommentAuthor(e.target.value)}
+                        placeholder={replyRole === 'customer' ? 'Customer email' : 'Agent name'}
+                        aria-label="Reply author"
+                        className="w-36 px-2.5 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-600"
+                      />
+                      <input
+                        type="text"
+                        value={commentBody}
+                        onChange={(e) => setCommentBody(e.target.value)}
+                        placeholder={
+                          replyRole === 'customer'
+                            ? 'Simulate customer reply...'
+                            : 'Add an internal or support note...'
+                        }
+                        aria-label="Comment body"
+                        className="flex-1 px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-600"
+                      />
+                      <button
+                        type="submit"
+                        disabled={isPostingComment}
+                        aria-label="Send message"
+                        className="inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors shrink-0 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <Send className="w-3.5 h-3.5" aria-hidden="true" />
+                        {isPostingComment
+                          ? 'Sending...'
+                          : replyRole === 'customer'
+                          ? 'Send Reply'
+                          : 'Post Note'}
+                      </button>
+                    </div>
+                    {commentError && (
+                      <p className="text-xs text-rose-700 font-medium">{commentError}</p>
+                    )}
+                  </form>
+                )}
               </div>
             </div>
           ) : (
@@ -984,10 +1635,12 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                   id="create-ticket-title"
                   className="font-display text-lg font-bold text-slate-900"
                 >
-                  Create Support Ticket
+                  {formParentTicketId
+                    ? `Create Follow-up Ticket (${formParentTicketId})`
+                    : 'Create Support Ticket'}
                 </h2>
                 <p className="text-xs text-slate-500 font-mono">
-                  POST /api/tickets -&gt; TicketCreate(BaseModel)
+                  POST /api/tickets -&gt; TicketCreate + Gemini Auto-Reply
                 </p>
               </div>
               <button
@@ -999,6 +1652,22 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                 <X className="w-5 h-5" aria-hidden="true" />
               </button>
             </div>
+
+            {formParentTicketId && (
+              <div className="p-3 rounded-lg bg-sky-50 border border-sky-200 flex items-center justify-between gap-2 text-xs text-sky-900">
+                <span>
+                  Linked to auto-closed ticket{' '}
+                  <span className="font-mono font-semibold">{formParentTicketId}</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setFormParentTicketId(null)}
+                  className="text-sky-700 hover:underline font-medium cursor-pointer"
+                >
+                  Unlink
+                </button>
+              </div>
+            )}
 
             <form onSubmit={handleCreateSubmit} className="space-y-4">
               <div>
@@ -1168,7 +1837,7 @@ export const TicketingWorkspace: React.FC<TicketingWorkspaceProps> = ({
                     disabled={isSubmitting}
                     className="px-4 py-2 text-sm font-semibold text-white bg-sky-700 hover:bg-sky-800 rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
                   >
-                    {isSubmitting ? 'Validating...' : 'Submit Ticket'}
+                    {isSubmitting ? 'Opening & Auto-Replying...' : 'Submit Ticket'}
                   </button>
                 </div>
               </div>

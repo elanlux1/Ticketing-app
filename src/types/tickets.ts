@@ -1,4 +1,4 @@
-export type TicketStatus = 'open' | 'in_progress' | 'resolved';
+export type TicketStatus = 'open' | 'in_progress' | 'resolved' | 'closed';
 export type TicketPriority = 'low' | 'medium' | 'high' | 'urgent';
 export type TicketCategory = 'billing' | 'bug' | 'feature' | 'account';
 export type CommentRole = 'customer' | 'agent';
@@ -33,6 +33,12 @@ export interface TicketRecord {
   assignee: string | null;
   comments: TicketComment[];
   ai_triage?: TicketTriageData | null;
+  reply_deadline_at?: string | null;
+  auto_closed?: boolean;
+  closed_at?: string | null;
+  closed_reason?: string | null;
+  parent_ticket_id?: string | null;
+  superseded_by_ticket_id?: string | null;
   created_at: string;
   updated_at: string;
 }

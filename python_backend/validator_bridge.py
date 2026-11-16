@@ -4,7 +4,7 @@ from typing import Literal, Optional
 import pydantic
 from pydantic import BaseModel, Field, ValidationError
 
-TicketStatus = Literal["open", "in_progress", "resolved"]
+TicketStatus = Literal["open", "in_progress", "resolved", "closed"]
 TicketPriority = Literal["low", "medium", "high", "urgent"]
 TicketCategory = Literal["billing", "bug", "feature", "account"]
 CommentRole = Literal["customer", "agent"]
@@ -22,6 +22,7 @@ class TicketCreate(BaseModel):
     )
     priority: TicketPriority = "medium"
     category: TicketCategory = "bug"
+    parent_ticket_id: Optional[str] = Field(default=None, min_length=3, max_length=30)
 
 
 class TicketUpdate(BaseModel):
@@ -78,9 +79,10 @@ RULES = {
         "requester_email": ("str", "pattern=r'^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$'"),
         "priority": ("Literal['low','medium','high','urgent']", "default='medium'"),
         "category": ("Literal['billing','bug','feature','account']", "default='bug'"),
+        "parent_ticket_id": ("Optional[str]", "default=None"),
     },
     "TicketUpdate": {
-        "status": ("Optional[Literal['open','in_progress','resolved']]", "default=None"),
+        "status": ("Optional[Literal['open','in_progress','resolved','closed']]", "default=None"),
         "priority": ("Optional[Literal['low','medium','high','urgent']]", "default=None"),
         "category": ("Optional[Literal['billing','bug','feature','account']]", "default=None"),
         "assignee": ("Optional[str]", "Field(default=None, min_length=2, max_length=60)"),
@@ -93,7 +95,7 @@ RULES = {
     "TriageResult": {
         "category": ("Literal['billing','bug','feature','account']", "Required enum from Gemini"),
         "priority": ("Literal['low','medium','high','urgent']", "Required enum from Gemini"),
-        "recommended_status": ("Literal['open','in_progress','resolved']", "Status transition from thread"),
+        "recommended_status": ("Literal['open','in_progress','resolved','closed']", "Status transition from thread"),
         "confidence": ("float", "Field(ge=0.0, le=1.0)"),
         "reasoning": ("str", "Field(min_length=5, max_length=240)"),
         "suggested_reply": ("str", "Field(min_length=10, max_length=450)"),
@@ -136,6 +138,8 @@ def validate_request(model_name: str, payload: dict) -> dict:
             out_val = dumped.get(field_name)
 
             if model_name == "TicketUpdate" and not in_payload:
+                continue
+            if model_name == "TicketCreate" and field_name == "parent_ticket_id" and not in_payload:
                 continue
 
             if not in_payload:

@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
-TicketStatus = Literal["open", "in_progress", "resolved"]
+TicketStatus = Literal["open", "in_progress", "resolved", "closed"]
 TicketPriority = Literal["low", "medium", "high", "urgent"]
 TicketCategory = Literal["billing", "bug", "feature", "account"]
 
@@ -24,6 +24,10 @@ class TicketCreate(BaseModel):
     )
     priority: TicketPriority = "medium"
     category: TicketCategory = "bug"
+    parent_ticket_id: Optional[str] = Field(
+        default=None,
+        description="Previous auto-closed ticket ID when opening a follow-up ticket",
+    )
 
 
 class TicketUpdate(BaseModel):
