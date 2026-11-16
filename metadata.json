@@ -1,0 +1,6 @@
+{
+  "name": "SchemaFlow — API, LLM & Pydantic Interactive Guide",
+  "description": "An interactive educational sandbox demonstrating how HTTP APIs, Large Language Models, and Pydantic data validation connect to form reliable AI software.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
